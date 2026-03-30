@@ -666,8 +666,7 @@ type execContext struct {
 	toolInfos      []*schema.ToolInfo
 	unwrappedTools []tool.BaseTool
 
-	rebuildGraph bool // whether needs to instantiate a new graph because of topology changes due to tool modifications
-	toolUpdated  bool // whether needs to pass a compose.WithToolList option to ToolsNode due to tool list change
+	toolUpdated bool // whether needs to pass a compose.WithToolList option to ToolsNode due to tool list change
 }
 
 func (a *ChatModelAgent) applyBeforeAgent(ctx context.Context, ec *execContext) (context.Context, *execContext, error) {
@@ -697,8 +696,6 @@ func (a *ChatModelAgent) applyBeforeAgent(ctx context.Context, ec *execContext) 
 		},
 		returnDirectly: runCtx.ReturnDirectly,
 		toolUpdated:    true,
-		rebuildGraph: (len(ec.toolsNodeConf.Tools) == 0 && len(runCtx.Tools) > 0) ||
-			(len(ec.returnDirectly) == 0 && len(runCtx.ReturnDirectly) > 0),
 	}
 
 	toolInfos, err := genToolInfos(ctx, &runtimeEC.toolsNodeConf)
@@ -771,7 +768,7 @@ func (a *ChatModelAgent) prepareExecContext(ctx context.Context) (*execContext, 
 	}, nil
 }
 
-// handleRunFuncError is the common error handler for buildNoToolsRunFunc and buildReActRunFunc.
+// handleRunFuncError is the common error handler for buildReActRunFunc.
 // It handles compose interrupts (both cancel-triggered and business)
 // and generic errors, sending the appropriate event to the generator.
 func (a *ChatModelAgent) handleRunFuncError(
@@ -820,103 +817,6 @@ func (a *ChatModelAgent) handleRunFuncError(
 		cancelCtx.markDone()
 	}
 	generator.Send(&AgentEvent{Err: err})
-}
-
-func (a *ChatModelAgent) buildNoToolsRunFunc(_ context.Context) runFunc {
-	type noToolsInput struct {
-		input       *AgentInput
-		instruction string
-	}
-
-	return func(ctx context.Context, p *runParams) {
-		cancelCtx := p.cancelCtx
-		ctx = withCancelContext(ctx, cancelCtx)
-
-		wrappedModel := buildModelWrappers(a.model, &modelWrapperConfig{
-			handlers:       a.handlers,
-			middlewares:    a.middlewares,
-			retryConfig:    a.modelRetryConfig,
-			failoverConfig: a.modelFailoverConfig,
-			cancelContext:  cancelCtx,
-		})
-
-		chain := compose.NewChain[noToolsInput, Message](
-			compose.WithGenLocalState(func(ctx context.Context) (state *State) {
-				return &State{}
-			})).
-			AppendLambda(compose.InvokableLambda(func(ctx context.Context, in noToolsInput) ([]Message, error) {
-				messages, err := a.genModelInput(ctx, in.instruction, in.input)
-				if err != nil {
-					return nil, err
-				}
-				_ = compose.ProcessState(ctx, func(_ context.Context, st *State) error {
-					st.Messages = append(st.Messages, messages...)
-					return nil
-				})
-				return messages, nil
-			})).
-			AppendChatModel(wrappedModel)
-
-		var compileOptions []compose.GraphCompileOption
-		compileOptions = append(compileOptions,
-			compose.WithGraphName(a.name),
-			compose.WithCheckPointStore(p.store),
-			compose.WithSerializer(&gobSerializer{}))
-
-		if cancelCtx != nil {
-			var interrupt func(...compose.GraphInterruptOption)
-			ctx, interrupt = compose.WithGraphInterrupt(ctx)
-			cancelCtx.setGraphInterruptFunc(cancelCtx.wrapGraphInterruptWithGracePeriod(interrupt))
-		}
-
-		r, err := chain.Compile(ctx, compileOptions...)
-		if err != nil {
-			p.generator.Send(&AgentEvent{Err: err})
-			return
-		}
-
-		ctx = withChatModelAgentExecCtx(ctx, &chatModelAgentExecCtx{
-			generator:                p.generator,
-			cancelCtx:                cancelCtx,
-			failoverLastSuccessModel: a.model,
-		})
-
-		// Pre-execution cancel check
-		if cancelCtx != nil && cancelCtx.shouldCancel() {
-			if cancelCtx.getMode() == CancelImmediate || atomic.LoadInt32(&cancelCtx.escalated) == 1 {
-				cancelErr, ok := cancelCtx.createAndMarkCancelHandled()
-				if !ok {
-					return
-				}
-				p.generator.Send(&AgentEvent{Err: cancelErr})
-				return
-			}
-		}
-
-		in := noToolsInput{input: p.input, instruction: p.instruction}
-
-		var msg Message
-		var msgStream MessageStream
-		if p.input.EnableStreaming {
-			msgStream, err = r.Stream(ctx, in, p.composeOpts...)
-		} else {
-			msg, err = r.Invoke(ctx, in, p.composeOpts...)
-		}
-
-		if err == nil {
-			if a.outputKey != "" {
-				err = setOutputToSession(ctx, msg, msgStream, a.outputKey)
-				if err != nil {
-					p.generator.Send(&AgentEvent{Err: err})
-				}
-			} else if msgStream != nil {
-				msgStream.Close()
-			}
-			return
-		}
-
-		a.handleRunFuncError(ctx, err, cancelCtx, p.cancelCtxOwned, p.store, p.generator)
-	}
 }
 
 func (a *ChatModelAgent) buildReActRunFunc(_ context.Context, bc *execContext) (runFunc, error) {
@@ -1055,11 +955,6 @@ func (a *ChatModelAgent) buildRunFunc(ctx context.Context) runFunc {
 
 		a.exeCtx = ec
 
-		if len(ec.toolsNodeConf.Tools) == 0 {
-			a.run = a.buildNoToolsRunFunc(ctx)
-			return
-		}
-
 		run, err := a.buildReActRunFunc(ctx, ec)
 		if err != nil {
 			a.run = errFunc(err)
@@ -1096,21 +991,7 @@ func (a *ChatModelAgent) getRunFunc(ctx context.Context) (context.Context, runFu
 		return ctx, nil, nil, err
 	}
 
-	if !runtimeBC.rebuildGraph {
-		return ctx, defaultRun, runtimeBC, nil
-	}
-
-	var tempRun runFunc
-	if len(runtimeBC.toolsNodeConf.Tools) == 0 {
-		tempRun = a.buildNoToolsRunFunc(ctx)
-	} else {
-		tempRun, err = a.buildReActRunFunc(ctx, runtimeBC)
-		if err != nil {
-			return ctx, nil, nil, err
-		}
-	}
-
-	return ctx, tempRun, runtimeBC, nil
+	return ctx, defaultRun, runtimeBC, nil
 }
 
 func (a *ChatModelAgent) Run(ctx context.Context, input *AgentInput, opts ...AgentRunOption) *AsyncIterator[*AgentEvent] {
