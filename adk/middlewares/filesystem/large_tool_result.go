@@ -57,8 +57,9 @@ func newToolResultOffloading(ctx context.Context, config *toolResultOffloadingCo
 	}
 
 	return compose.ToolMiddleware{
-		Invokable:  offloading.invoke,
-		Streamable: offloading.stream,
+		Invokable:         offloading.invoke,
+		Streamable:        offloading.stream,
+		EnhancedInvokable: offloading.enhancedInvoke,
 	}
 }
 
@@ -98,6 +99,60 @@ func (t *toolResultOffloading) stream(endpoint compose.StreamableToolEndpoint) c
 		}
 		return &compose.StreamToolOutput{Result: schema.StreamReaderFromArray([]string{result})}, nil
 	}
+}
+
+func (t *toolResultOffloading) enhancedInvoke(endpoint compose.EnhancedInvokableToolEndpoint) compose.EnhancedInvokableToolEndpoint {
+	return func(ctx context.Context, input *compose.ToolInput) (*compose.EnhancedInvokableToolOutput, error) {
+		output, err := endpoint(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+
+		result := output.Result
+		if result == nil || len(result.Parts) == 0 {
+			return output, nil
+		}
+
+		textOnly, text := textOnlyContent(result)
+		if !textOnly {
+			// Non-text (multimodal) results are not offloaded
+			return output, nil
+		}
+
+		offloaded, err := t.handleResult(ctx, text, input)
+		if err != nil {
+			return nil, err
+		}
+		if offloaded == text {
+			return output, nil
+		}
+		// Preserve any future fields on output / result; only rewrite Parts.
+		// Merge Extra from all original text parts so part-level metadata
+		// (e.g. cache keys, tracing tags) survives the offload replacement.
+		result.Parts = []schema.ToolOutputPart{{
+			Type:  schema.ToolPartTypeText,
+			Text:  offloaded,
+			Extra: mergeExtras(result.Parts),
+		}}
+		output.Result = result
+		return output, nil
+	}
+}
+
+func mergeExtras(parts []schema.ToolOutputPart) map[string]any {
+	var merged map[string]any
+	for _, p := range parts {
+		if len(p.Extra) == 0 {
+			continue
+		}
+		if merged == nil {
+			merged = make(map[string]any, len(p.Extra))
+		}
+		for k, v := range p.Extra {
+			merged[k] = v
+		}
+	}
+	return merged
 }
 
 func (t *toolResultOffloading) handleResult(ctx context.Context, result string, input *compose.ToolInput) (string, error) {
@@ -174,4 +229,18 @@ func formatToolMessage(s string) string {
 	}
 
 	return b.String()
+}
+
+func textOnlyContent(tr *schema.ToolResult) (textOnly bool, text string) {
+	if tr == nil || len(tr.Parts) == 0 {
+		return true, ""
+	}
+	var sb strings.Builder
+	for _, p := range tr.Parts {
+		if p.Type != schema.ToolPartTypeText {
+			return false, ""
+		}
+		sb.WriteString(p.Text)
+	}
+	return true, sb.String()
 }

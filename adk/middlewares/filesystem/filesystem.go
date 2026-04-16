@@ -18,6 +18,7 @@ package filesystem
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -92,7 +93,9 @@ type Config struct {
 	// LsToolConfig configures the ls tool
 	// optional
 	LsToolConfig *ToolConfig
-	// ReadFileToolConfig configures the read_file tool
+	// ReadFileToolConfig configures the read_file tool.
+	// This config applies to both the standard read_file tool (InvokableTool) and
+	// the enhanced read_file tool (EnhancedInvokableTool) when UseEnhancedRead is true.
 	// optional
 	ReadFileToolConfig *ToolConfig
 	// WriteFileToolConfig configures the write_file tool
@@ -107,6 +110,17 @@ type Config struct {
 	// GrepToolConfig configures the grep tool
 	// optional
 	GrepToolConfig *ToolConfig
+
+	// UseEnhancedRead enables multimodal read_file tool (EnhancedInvokableTool).
+	// When true, read_file returns results via schema.ToolResult.Parts instead of plain text string.
+	// Requires Backend to implement filesystem.EnhancedReader interface.
+	// The default EnhancedReader implementation supports reading image files (PNG, JPG, etc.)
+	// and PDF files with page range selection. See enhancedReadFileDescSuffix for detailed
+	// capability descriptions appended to the tool prompt.
+	// If you provide a custom EnhancedReader, you may need to override ReadFileToolConfig.Desc
+	// to accurately describe your implementation's capabilities.
+	// Default false, preserving backward compatibility.
+	UseEnhancedRead bool
 
 	// WithoutLargeToolResultOffloading disables automatic offloading of large tool result to Backend
 	// optional, false(enabled) by default
@@ -182,6 +196,7 @@ func NewMiddleware(ctx context.Context, config *Config) (adk.AgentMiddleware, er
 		EditFileToolConfig:      config.EditFileToolConfig,
 		GlobToolConfig:          config.GlobToolConfig,
 		GrepToolConfig:          config.GrepToolConfig,
+		UseEnhancedRead:         config.UseEnhancedRead,
 		CustomSystemPrompt:      config.CustomSystemPrompt,
 		CustomLsToolDesc:        config.CustomLsToolDesc,
 		CustomReadFileToolDesc:  config.CustomReadFileToolDesc,
@@ -233,7 +248,9 @@ type MiddlewareConfig struct {
 	// LsToolConfig configures the ls tool
 	// optional
 	LsToolConfig *ToolConfig
-	// ReadFileToolConfig configures the read_file tool
+	// ReadFileToolConfig configures the read_file tool.
+	// This config applies to both the standard read_file tool (InvokableTool) and
+	// the enhanced read_file tool (EnhancedInvokableTool) when UseEnhancedRead is true.
 	// optional
 	ReadFileToolConfig *ToolConfig
 	// WriteFileToolConfig configures the write_file tool
@@ -248,6 +265,17 @@ type MiddlewareConfig struct {
 	// GrepToolConfig configures the grep tool
 	// optional
 	GrepToolConfig *ToolConfig
+
+	// UseEnhancedRead enables multimodal read_file tool (EnhancedInvokableTool).
+	// When true, read_file returns results via schema.ToolResult.Parts instead of plain text string.
+	// Requires Backend to implement filesystem.EnhancedReader interface.
+	// The default EnhancedReader implementation supports reading image files (PNG, JPG, etc.)
+	// and PDF files with page range selection. See enhancedReadFileDescSuffix for detailed
+	// capability descriptions appended to the tool prompt.
+	// If you provide a custom EnhancedReader, you may need to override ReadFileToolConfig.Desc
+	// to accurately describe your implementation's capabilities.
+	// Default false, preserving backward compatibility.
+	UseEnhancedRead bool
 
 	// CustomSystemPrompt overrides the default ToolsSystemPrompt appended to agent instruction
 	// optional, ToolsSystemPrompt by default
@@ -406,6 +434,9 @@ func getFilesystemTools(_ context.Context, middlewareConfig *MiddlewareConfig) (
 			legacyDesc: middlewareConfig.CustomReadFileToolDesc,
 			createFunc: func(name, desc string) (tool.BaseTool, error) {
 				if middlewareConfig.Backend != nil {
+					if middlewareConfig.UseEnhancedRead {
+						return newEnhancedReadFileTool(middlewareConfig.Backend, name, desc)
+					}
 					return newReadFileTool(middlewareConfig.Backend, name, desc)
 				}
 				return nil, nil
@@ -554,6 +585,14 @@ type readFileArgs struct {
 	Limit int `json:"limit" jsonschema:"description=The number of lines to read. Only provide if the file is too large to read at once."`
 }
 
+// enhancedReadFileArgs extends readFileArgs with PDF-specific parameters for EnhancedReadFileTool.
+type enhancedReadFileArgs struct {
+	readFileArgs
+
+	// Pages is the page range for PDF files.
+	Pages string `json:"pages,omitempty" jsonschema:"description=Page range for PDF files (e.g.\\, \"1-5\"\\, \"3\"\\, \"10-20\"). Only applicable to PDF files. Maximum 20 pages per request."`
+}
+
 func newReadFileTool(fs filesystem.Backend, name string, desc string) (tool.BaseTool, error) {
 	toolName := selectToolName(name, ToolNameReadFile)
 	d, err := selectToolDesc(desc, ReadFileToolDesc, ReadFileToolDescChinese)
@@ -577,18 +616,111 @@ func newReadFileTool(fs filesystem.Backend, name string, desc string) (tool.Base
 			return "", err
 		}
 
-		startLine := input.Offset
-		lines := strings.Split(fileCt.Content, "\n")
-		var b strings.Builder
-		for i, line := range lines {
-			if i < len(lines)-1 {
-				fmt.Fprintf(&b, "%6d\t%s\n", startLine+i, line)
-			} else {
-				fmt.Fprintf(&b, "%6d\t%s", startLine+i, line)
-			}
+		return formatLineNumbers(fileCt.Content, input.Offset), nil
+	})
+}
 
+// formatLineNumbers prefixes each line of content with a 1-based line number
+// starting at startLine (e.g. "     1\tfoo"). startLine corresponds to the
+// line number of the first line in content (usually ReadRequest.Offset).
+func formatLineNumbers(content string, startLine int) string {
+	lines := strings.Split(content, "\n")
+	var b strings.Builder
+	for i, line := range lines {
+		if i < len(lines)-1 {
+			fmt.Fprintf(&b, "%6d\t%s\n", startLine+i, line)
+		} else {
+			fmt.Fprintf(&b, "%6d\t%s", startLine+i, line)
 		}
-		return b.String(), nil
+	}
+	return b.String()
+}
+
+func newEnhancedReadFileTool(fs filesystem.Backend, name string, desc string) (tool.BaseTool, error) {
+	er, ok := fs.(filesystem.EnhancedReader)
+	if !ok {
+		return nil, fmt.Errorf("UseEnhancedRead is enabled, but backend (type %T) does not implement filesystem.EnhancedReader interface. "+
+			"Either implement the EnhancedReader interface on your backend, or set UseEnhancedRead to false", fs)
+	}
+
+	toolName := selectToolName(name, ToolNameReadFile)
+	d, err := selectToolDesc(desc, ReadFileToolDesc, ReadFileToolDescChinese)
+	if err != nil {
+		return nil, err
+	}
+	// Only append the multimodal suffix when falling back to the built-in desc.
+	// A custom desc is expected to describe its own capabilities, so appending
+	// would produce duplicated or contradictory descriptions.
+	if desc == "" {
+		d += internal.SelectPrompt(internal.I18nPrompts{
+			English: enhancedReadFileDescSuffix,
+			Chinese: enhancedReadFileDescSuffixChinese,
+		})
+	}
+
+	return utils.InferEnhancedTool(toolName, d, func(ctx context.Context, input enhancedReadFileArgs) (*schema.ToolResult, error) {
+		if input.Offset <= 0 {
+			input.Offset = 1
+		}
+		if input.Limit <= 0 {
+			input.Limit = 2000
+		}
+
+		fileCt, err := er.EnhancedRead(ctx, &filesystem.ReadRequest{
+			FilePath: input.FilePath,
+			Offset:   input.Offset,
+			Limit:    input.Limit,
+			Pages:    input.Pages,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		// Multimodal result: convert FileContentPart to ToolOutputPart
+		if len(fileCt.Parts) > 0 {
+			parts := make([]schema.ToolOutputPart, 0, len(fileCt.Parts))
+			for _, p := range fileCt.Parts {
+				if len(p.Data) == 0 {
+					return nil, fmt.Errorf("FileContentPart.Data is empty for type %s", p.Type)
+				}
+				if p.MIMEType == "" {
+					return nil, fmt.Errorf("FileContentPart.MIMEType is empty for type %s", p.Type)
+				}
+				b64 := base64.StdEncoding.EncodeToString(p.Data)
+				switch p.Type {
+				case filesystem.FileContentPartTypeImage:
+					parts = append(parts, schema.ToolOutputPart{
+						Type: schema.ToolPartTypeImage,
+						Image: &schema.ToolOutputImage{
+							MessagePartCommon: schema.MessagePartCommon{
+								MIMEType:   p.MIMEType,
+								Base64Data: &b64,
+							},
+						},
+					})
+				case filesystem.FileContentPartTypeFile:
+					parts = append(parts, schema.ToolOutputPart{
+						Type: schema.ToolPartTypeFile,
+						File: &schema.ToolOutputFile{
+							MessagePartCommon: schema.MessagePartCommon{
+								MIMEType:   p.MIMEType,
+								Base64Data: &b64,
+							},
+						},
+					})
+				default:
+					// FileContentPartType is defined by Backend implementations.
+					// Unrecognized types are unlikely but should fail explicitly rather than silently.
+					return nil, fmt.Errorf("unsupported FileContentPartType: %s", p.Type)
+				}
+			}
+			return &schema.ToolResult{Parts: parts}, nil
+		}
+
+		// Text-only: apply line number formatting
+		return &schema.ToolResult{
+			Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: formatLineNumbers(fileCt.Content, input.Offset)}},
+		}, nil
 	})
 }
 

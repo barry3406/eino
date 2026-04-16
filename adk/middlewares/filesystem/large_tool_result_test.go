@@ -609,3 +609,133 @@ func (f *failingBackend) GlobInfo(ctx context.Context, _ *GlobInfoRequest) ([]Fi
 func (f *failingBackend) Edit(ctx context.Context, _ *EditRequest) error {
 	return nil
 }
+
+func TestToolResultOffloading_EnhancedInvoke_SmallText(t *testing.T) {
+	ctx := context.Background()
+	backend := newMockBackend()
+	middleware := newToolResultOffloading(ctx, &toolResultOffloadingConfig{
+		Backend:    backend,
+		TokenLimit: 100,
+	})
+
+	smallResult := &schema.ToolResult{
+		Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: "hello"}},
+	}
+	endpoint := func(ctx context.Context, input *compose.ToolInput) (*compose.EnhancedInvokableToolOutput, error) {
+		return &compose.EnhancedInvokableToolOutput{Result: smallResult}, nil
+	}
+
+	output, err := middleware.EnhancedInvokable(endpoint)(ctx, &compose.ToolInput{Name: "t", CallID: "c_small"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if output.Result != smallResult {
+		t.Errorf("small text-only result should pass through unchanged")
+	}
+	if len(backend.files) != 0 {
+		t.Errorf("no file should be written for small result, got %d", len(backend.files))
+	}
+}
+
+func TestToolResultOffloading_EnhancedInvoke_LargeText(t *testing.T) {
+	ctx := context.Background()
+	backend := newMockBackend()
+	middleware := newToolResultOffloading(ctx, &toolResultOffloadingConfig{
+		Backend:    backend,
+		TokenLimit: 10,
+	})
+
+	largePart1 := strings.Repeat("part1 ", 20)
+	largePart2 := strings.Repeat("part2 ", 20)
+	endpoint := func(ctx context.Context, input *compose.ToolInput) (*compose.EnhancedInvokableToolOutput, error) {
+		return &compose.EnhancedInvokableToolOutput{
+			Result: &schema.ToolResult{Parts: []schema.ToolOutputPart{
+				{Type: schema.ToolPartTypeText, Text: largePart1},
+				{Type: schema.ToolPartTypeText, Text: largePart2},
+			}},
+		}, nil
+	}
+
+	output, err := middleware.EnhancedInvokable(endpoint)(ctx, &compose.ToolInput{Name: "t", CallID: "c_large"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(output.Result.Parts) != 1 || output.Result.Parts[0].Type != schema.ToolPartTypeText {
+		t.Fatalf("expected a single text part after offloading, got %+v", output.Result.Parts)
+	}
+	if !strings.Contains(output.Result.Parts[0].Text, "Tool result too large") {
+		t.Errorf("expected offload message, got %q", output.Result.Parts[0].Text)
+	}
+	saved, ok := backend.files["/large_tool_result/c_large"]
+	if !ok {
+		t.Fatalf("expected offloaded file, got files: %v", backend.files)
+	}
+	if saved != largePart1+largePart2 {
+		t.Errorf("saved content should equal concatenated text parts")
+	}
+}
+
+func TestToolResultOffloading_EnhancedInvoke_MultimodalNotOffloaded(t *testing.T) {
+	ctx := context.Background()
+	backend := newMockBackend()
+	middleware := newToolResultOffloading(ctx, &toolResultOffloadingConfig{
+		Backend:    backend,
+		TokenLimit: 1, // tiny so any text would otherwise offload
+	})
+
+	bigText := strings.Repeat("x", 500)
+	multimodal := &schema.ToolResult{Parts: []schema.ToolOutputPart{
+		{Type: schema.ToolPartTypeText, Text: bigText},
+		{Type: schema.ToolPartTypeImage, Image: &schema.ToolOutputImage{}},
+	}}
+	endpoint := func(ctx context.Context, input *compose.ToolInput) (*compose.EnhancedInvokableToolOutput, error) {
+		return &compose.EnhancedInvokableToolOutput{Result: multimodal}, nil
+	}
+
+	output, err := middleware.EnhancedInvokable(endpoint)(ctx, &compose.ToolInput{Name: "t", CallID: "c_mm"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if output.Result != multimodal {
+		t.Errorf("multimodal result should pass through unchanged")
+	}
+	if len(backend.files) != 0 {
+		t.Errorf("multimodal result should not trigger offload, got %d files", len(backend.files))
+	}
+}
+
+func TestToolResultOffloading_EnhancedInvoke_EmptyPartsPassThrough(t *testing.T) {
+	ctx := context.Background()
+	backend := newMockBackend()
+	middleware := newToolResultOffloading(ctx, &toolResultOffloadingConfig{Backend: backend, TokenLimit: 1})
+
+	empty := &schema.ToolResult{}
+	endpoint := func(ctx context.Context, input *compose.ToolInput) (*compose.EnhancedInvokableToolOutput, error) {
+		return &compose.EnhancedInvokableToolOutput{Result: empty}, nil
+	}
+
+	output, err := middleware.EnhancedInvokable(endpoint)(ctx, &compose.ToolInput{Name: "t", CallID: "c_empty"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if output.Result != empty {
+		t.Errorf("empty-parts result should pass through unchanged (no offload)")
+	}
+	if len(backend.files) != 0 {
+		t.Errorf("empty-parts result should not trigger offload")
+	}
+}
+
+func TestToolResultOffloading_EnhancedInvoke_EndpointError(t *testing.T) {
+	ctx := context.Background()
+	middleware := newToolResultOffloading(ctx, &toolResultOffloadingConfig{Backend: newMockBackend()})
+
+	sentinel := errors.New("endpoint failed")
+	endpoint := func(ctx context.Context, input *compose.ToolInput) (*compose.EnhancedInvokableToolOutput, error) {
+		return nil, sentinel
+	}
+	_, err := middleware.EnhancedInvokable(endpoint)(ctx, &compose.ToolInput{Name: "t", CallID: "c_err"})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected endpoint error to propagate, got %v", err)
+	}
+}

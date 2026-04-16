@@ -18,6 +18,7 @@ package filesystem
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -289,7 +290,7 @@ func TestWriteFileTool(t *testing.T) {
 		t.Fatalf("Failed to read written file: %v", err)
 	}
 	if content.Content != "new content" {
-		t.Errorf("Expected written content to be 'new content', got %q", content)
+		t.Errorf("Expected written content to be 'new content', got %q", content.Content)
 	}
 }
 
@@ -2272,4 +2273,282 @@ type mockShellBackendWithError struct{}
 
 func (m *mockShellBackendWithError) Execute(ctx context.Context, req *filesystem.ExecuteRequest) (*filesystem.ExecuteResponse, error) {
 	return nil, errors.New("shell execution error")
+}
+
+// enhancedBackend wraps InMemoryBackend and implements EnhancedReader for testing.
+type enhancedBackend struct {
+	*filesystem.InMemoryBackend
+	enhancedReadFunc func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error)
+}
+
+func (b *enhancedBackend) EnhancedRead(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+	return b.enhancedReadFunc(ctx, req)
+}
+
+func TestEnhancedReadFileTool_TextOnly(t *testing.T) {
+	base := setupTestBackend()
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			return base.Read(ctx, req)
+		},
+	}
+
+	enhancedTool, err := newEnhancedReadFileTool(eb, "", "")
+	assert.NoError(t, err)
+
+	result, err := enhancedTool.(tool.EnhancedInvokableTool).InvokableRun(
+		context.Background(), &schema.ToolArgument{Text: `{"file_path": "/file1.txt", "offset": 0, "limit": 100}`})
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Len(t, result.Parts, 1)
+	assert.Equal(t, schema.ToolPartTypeText, result.Parts[0].Type)
+	assert.Contains(t, result.Parts[0].Text, "line1")
+	assert.Contains(t, result.Parts[0].Text, "line5")
+
+	textOnly, text := textOnlyContent(result)
+	assert.True(t, textOnly)
+	assert.Contains(t, text, "line1")
+}
+
+func TestEnhancedReadFileTool_Multimodal(t *testing.T) {
+	base := setupTestBackend()
+	imgData := []byte("rawimagedata")
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			return &filesystem.FileContent{
+				Parts: []filesystem.FileContentPart{
+					{
+						Type:     filesystem.FileContentPartTypeImage,
+						MIMEType: "image/png",
+						Data:     imgData,
+					},
+				},
+			}, nil
+		},
+	}
+
+	enhancedTool, err := newEnhancedReadFileTool(eb, "", "")
+	assert.NoError(t, err)
+
+	result, err := enhancedTool.(tool.EnhancedInvokableTool).InvokableRun(
+		context.Background(), &schema.ToolArgument{Text: `{"file_path": "/image.png", "offset": 0, "limit": 100}`})
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Len(t, result.Parts, 1)
+	assert.Equal(t, schema.ToolPartTypeImage, result.Parts[0].Type)
+
+	textOnly, _ := textOnlyContent(result)
+	assert.False(t, textOnly)
+
+	// Verify base64 encoding correctness
+	assert.NotNil(t, result.Parts[0].Image)
+	assert.Equal(t, "image/png", result.Parts[0].Image.MIMEType)
+	assert.Equal(t, base64.StdEncoding.EncodeToString(imgData), *result.Parts[0].Image.Base64Data)
+}
+
+func TestEnhancedReadFileTool_FileType(t *testing.T) {
+	base := setupTestBackend()
+	pdfData := []byte("fakepdfcontent")
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			return &filesystem.FileContent{
+				Parts: []filesystem.FileContentPart{
+					{
+						Type:     filesystem.FileContentPartTypeFile,
+						MIMEType: "application/pdf",
+						Data:     pdfData,
+					},
+				},
+			}, nil
+		},
+	}
+
+	enhancedTool, err := newEnhancedReadFileTool(eb, "", "")
+	assert.NoError(t, err)
+
+	result, err := enhancedTool.(tool.EnhancedInvokableTool).InvokableRun(
+		context.Background(), &schema.ToolArgument{Text: `{"file_path": "/doc.pdf", "offset": 0, "limit": 100}`})
+	assert.NoError(t, err)
+	assert.Len(t, result.Parts, 1)
+	assert.Equal(t, schema.ToolPartTypeFile, result.Parts[0].Type)
+	assert.NotNil(t, result.Parts[0].File)
+	assert.Equal(t, "application/pdf", result.Parts[0].File.MIMEType)
+	assert.Equal(t, base64.StdEncoding.EncodeToString(pdfData), *result.Parts[0].File.Base64Data)
+}
+
+func TestEnhancedReadFileTool_UnsupportedPartType(t *testing.T) {
+	base := setupTestBackend()
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			return &filesystem.FileContent{
+				Parts: []filesystem.FileContentPart{
+					{
+						Type:     filesystem.FileContentPartType("unknown"),
+						MIMEType: "application/octet-stream",
+						Data:     []byte("data"),
+					},
+				},
+			}, nil
+		},
+	}
+
+	enhancedTool, err := newEnhancedReadFileTool(eb, "", "")
+	assert.NoError(t, err)
+
+	_, err = enhancedTool.(tool.EnhancedInvokableTool).InvokableRun(
+		context.Background(), &schema.ToolArgument{Text: `{"file_path": "/file.bin", "offset": 0, "limit": 100}`})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported FileContentPartType")
+}
+
+func TestEnhancedReadFileTool_PagesPassThrough(t *testing.T) {
+	base := setupTestBackend()
+	var capturedPages string
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			capturedPages = req.Pages
+			return &filesystem.FileContent{Content: "page content"}, nil
+		},
+	}
+
+	enhancedTool, err := newEnhancedReadFileTool(eb, "", "")
+	assert.NoError(t, err)
+
+	_, err = enhancedTool.(tool.EnhancedInvokableTool).InvokableRun(
+		context.Background(), &schema.ToolArgument{Text: `{"file_path": "/doc.pdf", "pages": "1-5"}`})
+	assert.NoError(t, err)
+	assert.Equal(t, "1-5", capturedPages)
+}
+
+func TestEnhancedReadFileTool_BackendNotEnhancedReader(t *testing.T) {
+	base := setupTestBackend()
+	_, err := newEnhancedReadFileTool(base, "", "")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "EnhancedReader")
+}
+
+func TestUseEnhancedRead_Routing(t *testing.T) {
+	base := setupTestBackend()
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			return base.Read(ctx, req)
+		},
+	}
+
+	// UseEnhancedRead=false should create standard tool
+	tools, err := getFilesystemTools(context.Background(), &MiddlewareConfig{
+		Backend:         base,
+		UseEnhancedRead: false,
+	})
+	assert.NoError(t, err)
+	for _, tl := range tools {
+		info, _ := tl.Info(context.Background())
+		if info != nil && info.Name == ToolNameReadFile {
+			_, isEnhanced := tl.(tool.EnhancedInvokableTool)
+			assert.False(t, isEnhanced, "should be standard InvokableTool when UseEnhancedRead=false")
+		}
+	}
+
+	// UseEnhancedRead=true with enhanced backend should create enhanced tool
+	tools2, err := getFilesystemTools(context.Background(), &MiddlewareConfig{
+		Backend:         eb,
+		UseEnhancedRead: true,
+	})
+	assert.NoError(t, err)
+	for _, tl := range tools2 {
+		info, _ := tl.Info(context.Background())
+		if info != nil && info.Name == ToolNameReadFile {
+			_, isEnhanced := tl.(tool.EnhancedInvokableTool)
+			assert.True(t, isEnhanced, "should be EnhancedInvokableTool when UseEnhancedRead=true")
+		}
+	}
+}
+
+// TestEnhancedReadFileTool_SchemaContainsAllFields verifies that the JSON schema
+// exposed to the LLM includes both the embedded readFileArgs fields (file_path,
+// offset, limit) and the enhanced-only "pages" field. Guards against the
+// jsonschema library failing to flatten an unexported anonymous embedded struct.
+func TestEnhancedReadFileTool_SchemaContainsAllFields(t *testing.T) {
+	base := setupTestBackend()
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			return base.Read(ctx, req)
+		},
+	}
+
+	enhancedTool, err := newEnhancedReadFileTool(eb, "", "")
+	assert.NoError(t, err)
+
+	info, err := enhancedTool.Info(context.Background())
+	assert.NoError(t, err)
+	assert.NotNil(t, info)
+
+	js, err := info.ParamsOneOf.ToJSONSchema()
+	assert.NoError(t, err)
+	assert.NotNil(t, js)
+	assert.NotNil(t, js.Properties, "schema should have properties")
+
+	for _, field := range []string{"file_path", "offset", "limit", "pages"} {
+		_, ok := js.Properties.Get(field)
+		assert.True(t, ok, "expected JSON schema to contain field %q, schema=%+v", field, js.Properties)
+	}
+}
+
+// TestEnhancedReadFileTool_CustomDescNoSuffix verifies that when a custom desc is
+// provided, the multimodal suffix is NOT appended (user's desc replaces default).
+func TestEnhancedReadFileTool_CustomDescNoSuffix(t *testing.T) {
+	base := setupTestBackend()
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			return base.Read(ctx, req)
+		},
+	}
+
+	customDesc := "my custom read tool description"
+	enhancedTool, err := newEnhancedReadFileTool(eb, "", customDesc)
+	assert.NoError(t, err)
+
+	info, err := enhancedTool.Info(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, customDesc, info.Desc, "custom desc should not be augmented with multimodal suffix")
+
+	// With empty desc (fallback to default), suffix should be appended.
+	defaultTool, err := newEnhancedReadFileTool(eb, "", "")
+	assert.NoError(t, err)
+	defaultInfo, err := defaultTool.Info(context.Background())
+	assert.NoError(t, err)
+	assert.Contains(t, defaultInfo.Desc, "multimodal", "default desc should include multimodal suffix")
+}
+
+// TestEnhancedReadFileTool_EmptyPartDataError verifies that a FileContentPart
+// with empty Data fails explicitly rather than silently encoding to an empty
+// base64 string.
+func TestEnhancedReadFileTool_EmptyPartDataError(t *testing.T) {
+	base := setupTestBackend()
+	eb := &enhancedBackend{
+		InMemoryBackend: base,
+		enhancedReadFunc: func(ctx context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
+			return &filesystem.FileContent{
+				Parts: []filesystem.FileContentPart{
+					{Type: filesystem.FileContentPartTypeImage, MIMEType: "image/png", Data: nil},
+				},
+			}, nil
+		},
+	}
+
+	enhancedTool, err := newEnhancedReadFileTool(eb, "", "")
+	assert.NoError(t, err)
+
+	_, err = enhancedTool.(tool.EnhancedInvokableTool).InvokableRun(
+		context.Background(), &schema.ToolArgument{Text: `{"file_path": "/x"}`})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "empty")
 }

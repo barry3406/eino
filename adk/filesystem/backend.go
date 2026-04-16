@@ -73,6 +73,10 @@ type ReadRequest struct {
 	// Limit specifies the maximum number of lines to read.
 	// When Limit is 0 (default), the entire file content is returned.
 	Limit int
+
+	// Pages specifies the page range for PDF files (e.g. "1-5", "3", "10-20").
+	// Only applicable when using EnhancedReader for PDF reading.
+	Pages string
 }
 
 // GrepRequest contains parameters for searching file content.
@@ -168,8 +172,46 @@ type EditRequest struct {
 	ReplaceAll bool
 }
 
+// FileContentPartType defines the type of a multimodal file content part.
+type FileContentPartType string
+
+const (
+	// FileContentPartTypeImage represents an image part (e.g. PNG, JPG).
+	FileContentPartTypeImage FileContentPartType = "image"
+	// FileContentPartTypeFile represents a file part (e.g. PDF).
+	FileContentPartTypeFile FileContentPartType = "file"
+)
+
+// FileContentPart represents a multimodal part of file content.
+// Data holds raw bytes; encoding (e.g. base64) is handled by the consumer.
+type FileContentPart struct {
+	// Type is the kind of content this part represents.
+	// Required.
+	Type FileContentPartType
+
+	// MIMEType is the MIME type of the content (e.g. "image/png", "application/pdf").
+	// Required.
+	MIMEType string
+
+	// Data is the raw binary content.
+	// Required.
+	Data []byte
+}
+
+// FileContent holds the result of an EnhancedRead operation.
 type FileContent struct {
+	// Content holds the plain text content of the file.
 	Content string
+	// Parts holds multimodal output parts (e.g. image, PDF).
+	// When non-empty, Content is ignored and Parts is used as the tool result.
+	Parts []FileContentPart
+}
+
+// EnhancedReader is an optional extension interface for Backend.
+// Backends that implement this interface support multimodal file reading
+// (e.g. returning images as base64 image parts).
+type EnhancedReader interface {
+	EnhancedRead(ctx context.Context, req *ReadRequest) (*FileContent, error)
 }
 
 // Backend is a pluggable, unified file backend protocol interface.
